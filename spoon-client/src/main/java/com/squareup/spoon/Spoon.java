@@ -3,11 +3,11 @@ package com.squareup.spoon;
 import android.app.Activity;
 import android.content.Context;
 import android.graphics.Bitmap;
-import android.graphics.Canvas;
 import android.os.Build;
 import android.os.Looper;
 import android.util.Log;
-import android.view.View;
+import com.squareup.spoon.retrievers.ActivityScreenshotGrabber;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.File;
@@ -22,7 +22,6 @@ import java.util.regex.Pattern;
 
 import static android.content.Context.MODE_WORLD_READABLE;
 import static android.graphics.Bitmap.CompressFormat.PNG;
-import static android.graphics.Bitmap.Config.ARGB_8888;
 import static android.os.Environment.getExternalStorageDirectory;
 import static com.squareup.spoon.Chmod.chmodPlusR;
 import static com.squareup.spoon.Chmod.chmodPlusRWX;
@@ -42,8 +41,6 @@ public final class Spoon {
   private static final String TAG = "Spoon";
   private static final Object LOCK = new Object();
   private static final Pattern TAG_VALIDATION = Pattern.compile("[a-zA-Z0-9_-]+");
-  private static final int LOLLIPOP_API_LEVEL = 21;
-  private static final int MARSHMALLOW_API_LEVEL = 23;
 
   /** Holds a set of directories that have been cleared for this test */
   private static Set<String> clearedOutputDirectories = new HashSet<String>();
@@ -56,10 +53,23 @@ public final class Spoon {
    * @return the image file that was created
    */
   public static File screenshot(Activity activity, String tag) {
+    return screenshot(activity, tag, new ActivityScreenshotGrabber(activity));
+  }
+
+  /**
+   * Take a screenshot with the specified tag.
+   *
+   * @param activity Activity with which to capture a screenshot.
+   * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
+   * @param screenshotGrabber Bitmap retriever that will be called in UI thread
+   * @return the image file that was created
+   */
+  public static File screenshot(Activity activity, String tag,
+                                ScreenshotGrabber screenshotGrabber) {
     StackTraceElement testClass = findTestClassTraceElement(Thread.currentThread().getStackTrace());
     String className = testClass.getClassName().replaceAll("[^A-Za-z0-9._-]", "_");
     String methodName = testClass.getMethodName();
-    return screenshot(activity, tag, className, methodName);
+    return screenshot(activity, tag, className, methodName, screenshotGrabber);
   }
 
   /**
@@ -72,17 +82,33 @@ public final class Spoon {
    * @return the image file that was created
    */
   public static File screenshot(Activity activity, String tag, String testClassName,
-      String testMethodName) {
+                                String testMethodName) {
+    ActivityScreenshotGrabber screenshotGrabber = new ActivityScreenshotGrabber(activity);
+    return screenshot(activity, tag, testClassName, testMethodName, screenshotGrabber);
+  }
+
+  /**
+   * Take a screenshot with the specified tag.  This version allows the caller to manually specify
+   * the test class name and method name.  This is necessary when the screenshot is not called in
+   * the traditional manner.
+   *
+   * @param activity Activity with which to capture a screenshot.
+   * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
+   * @param screenshotGrabber Bitmap retriever that will be called in UI thread
+   * @return the image file that was created
+   */
+  public static File screenshot(Activity activity, String tag, String testClassName,
+                                String testMethodName, ScreenshotGrabber screenshotGrabber) {
     if (!TAG_VALIDATION.matcher(tag).matches()) {
       throw new IllegalArgumentException("Tag must match " + TAG_VALIDATION.pattern() + ".");
     }
     try {
       File screenshotDirectory =
-          obtainScreenshotDirectory(activity.getApplicationContext(), testClassName,
-              testMethodName);
+              obtainScreenshotDirectory(activity.getApplicationContext(), testClassName,
+                      testMethodName);
       String screenshotName = System.currentTimeMillis() + NAME_SEPARATOR + tag + EXTENSION;
       File screenshotFile = new File(screenshotDirectory, screenshotName);
-      takeScreenshot(screenshotFile, activity);
+      takeScreenshot(screenshotFile, activity, screenshotGrabber);
       Log.d(TAG, "Captured screenshot '" + tag + "'.");
       return screenshotFile;
     } catch (Exception e) {
@@ -90,25 +116,20 @@ public final class Spoon {
     }
   }
 
-  private static void takeScreenshot(File file, final Activity activity) throws IOException {
-    View view = activity.getWindow().getDecorView();
-    if (view.getWidth() == 0 || view.getHeight() == 0) {
-      throw new IOException("Your view has no height or width. Are you sure "
-              + activity.getClass().getSimpleName()
-              + " is the currently displayed activity?");
-    }
-    final Bitmap bitmap = Bitmap.createBitmap(view.getWidth(), view.getHeight(), ARGB_8888);
-
+  private static void takeScreenshot(final File file,
+                                     final Activity activity, final ScreenshotGrabber screenshotGrabber) throws IOException {
+    final BitmapReference ref = new BitmapReference();
     if (Looper.myLooper() == Looper.getMainLooper()) {
       // On main thread already, Just Do It™.
-      drawDecorViewToBitmap(activity, bitmap);
+      ref.bitmap = screenshotGrabber.take();
     } else {
       // On a background thread, post to main.
       final CountDownLatch latch = new CountDownLatch(1);
       activity.runOnUiThread(new Runnable() {
-        @Override public void run() {
+        @Override
+        public void run() {
           try {
-            drawDecorViewToBitmap(activity, bitmap);
+            ref.bitmap = screenshotGrabber.take();
           } finally {
             latch.countDown();
           }
@@ -117,38 +138,42 @@ public final class Spoon {
       try {
         latch.await();
       } catch (InterruptedException e) {
-        String msg = "Unable to get screenshot " + file.getAbsolutePath();
-        Log.e(TAG, msg, e);
-        throw new RuntimeException(msg, e);
+        throwExceptionGetScreenshot(file, e);
       }
+    }
+
+    if (ref.bitmap == null) {
+      throwExceptionGetScreenshot(file, new Exception("Retrieved bitmap is null"));
     }
 
     OutputStream fos = null;
     try {
       fos = new BufferedOutputStream(new FileOutputStream(file));
-      bitmap.compress(PNG, 100 /* quality */, fos);
+      ref.bitmap.compress(PNG, 100 /* quality */, fos);
 
       chmodPlusR(file);
     } finally {
-      bitmap.recycle();
+      ref.bitmap.recycle();
       if (fos != null) {
         fos.close();
       }
     }
   }
 
-  private static void drawDecorViewToBitmap(Activity activity, Bitmap bitmap) {
-    Canvas canvas = new Canvas(bitmap);
-    activity.getWindow().getDecorView().draw(canvas);
+  private static void throwExceptionGetScreenshot(File file, Exception e) {
+    String msg = "Unable to get screenshot " + file.getAbsolutePath();
+    Log.e(TAG, msg, e);
+    throw new RuntimeException(msg, e);
   }
 
   private static File obtainScreenshotDirectory(Context context, String testClassName,
-      String testMethodName) throws IllegalAccessException {
+                                                String testMethodName) throws IllegalAccessException {
     return filesDirectory(context, SPOON_SCREENSHOTS, testClassName, testMethodName);
   }
 
   /**
    * Alternative to {@link #save(Context, File)}
+   *
    * @param context Context used to access files.
    * @param path Path to the file you want to save.
    * @return the copy that was created.
@@ -200,7 +225,7 @@ public final class Spoon {
 
     final BufferedInputStream is = new BufferedInputStream(new FileInputStream(source));
     final BufferedOutputStream os = new BufferedOutputStream(new FileOutputStream(target));
-    byte [] buffer = new byte[4096];
+    byte[] buffer = new byte[4096];
     while (is.read(buffer) > 0) {
       os.write(buffer);
     }
@@ -209,9 +234,9 @@ public final class Spoon {
   }
 
   private static File filesDirectory(Context context, String directoryType, String testClassName,
-      String testMethodName) throws IllegalAccessException {
+                                     String testMethodName) throws IllegalAccessException {
     File directory;
-    if (Build.VERSION.SDK_INT >= LOLLIPOP_API_LEVEL) {
+    if (Build.VERSION.SDK_INT >= 21) {
       // Use external storage.
       directory = new File(getExternalStorageDirectory(), "app_" + directoryType);
     } else {
@@ -237,12 +262,12 @@ public final class Spoon {
     for (int i = trace.length - 1; i >= 0; i--) {
       StackTraceElement element = trace[i];
       if (TEST_CASE_CLASS_JUNIT_3.equals(element.getClassName()) //
-          && TEST_CASE_METHOD_JUNIT_3.equals(element.getMethodName())) {
+              && TEST_CASE_METHOD_JUNIT_3.equals(element.getMethodName())) {
         return extractStackElement(trace, i);
       }
 
       if (TEST_CASE_CLASS_JUNIT_4.equals(element.getClassName()) //
-          && TEST_CASE_METHOD_JUNIT_4.equals(element.getMethodName())) {
+              && TEST_CASE_METHOD_JUNIT_4.equals(element.getMethodName())) {
         return extractStackElement(trace, i);
       }
       if (TEST_CASE_CLASS_CUCUMBER_JVM.equals(element.getClassName()) //
@@ -256,7 +281,7 @@ public final class Spoon {
 
   private static StackTraceElement extractStackElement(StackTraceElement[] trace, int i) {
     //Stacktrace length changed in M
-    int testClassTraceIndex = Build.VERSION.SDK_INT >= MARSHMALLOW_API_LEVEL ? (i - 2) : (i - 3);
+    int testClassTraceIndex = Build.VERSION.SDK_INT >= 23 ? (i - 2) : (i - 3);
     return trace[testClassTraceIndex];
   }
 
@@ -288,4 +313,9 @@ public final class Spoon {
   private Spoon() {
     // No instances.
   }
+
+  private static class BitmapReference {
+    private Bitmap bitmap;
+  }
+
 }
